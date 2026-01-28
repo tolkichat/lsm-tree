@@ -403,6 +403,37 @@ impl Table {
         iter
     }
 
+    /// Returns all entries for a key with seqno <= requested seqno.
+    ///
+    /// Entries are returned in order from highest seqno (newest) to lowest seqno (oldest).
+    /// This is used for merge operator support to collect all merge operands from a table.
+    #[doc(hidden)]
+    pub fn range_for_key(&self, key: &[u8], seqno: SeqNo) -> crate::Result<Vec<InternalValue>> {
+        if seqno == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::new();
+        let user_key: UserKey = key.into();
+
+        // Iterate from the key, collecting entries while user_key matches
+        for item_result in self.range(user_key.clone()..) {
+            let item = item_result?;
+
+            // Stop if we've moved past our key
+            if item.key.user_key != user_key {
+                break;
+            }
+
+            // Only include entries with seqno <= requested
+            if item.key.seqno <= seqno {
+                results.push(item);
+            }
+        }
+
+        Ok(results)
+    }
+
     fn read_tli(
         regions: &ParsedRegions,
         file: &File,

@@ -2,8 +2,11 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use crate::{InternalValue, SeqNo, UserKey, ValueType};
-use std::iter::Peekable;
+use crate::{
+    merge_operator::{MergeOperator, MergeResult},
+    InternalValue, SeqNo, UserKey, UserValue, ValueType,
+};
+use std::{iter::Peekable, sync::Arc};
 
 type Item = crate::Result<InternalValue>;
 
@@ -31,6 +34,9 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>> {
     evict_tombstones: bool,
 
     zero_seqnos: bool,
+
+    /// Optional merge operator for combining merge operands
+    merge_operator: Option<Arc<dyn MergeOperator>>,
 }
 
 impl<'a, I: Iterator<Item = Item>> CompactionStream<'a, I> {
@@ -45,6 +51,7 @@ impl<'a, I: Iterator<Item = Item>> CompactionStream<'a, I> {
             expiration_callback: None,
             evict_tombstones: false,
             zero_seqnos: false,
+            merge_operator: None,
         }
     }
 
@@ -64,6 +71,12 @@ impl<'a, I: Iterator<Item = Item>> CompactionStream<'a, I> {
     /// This can save a lot of space, because "0" only takes 1 byte, and sequence numbers are monotonically increasing.
     pub fn zero_seqnos(mut self, b: bool) -> Self {
         self.zero_seqnos = b;
+        self
+    }
+
+    /// Sets the merge operator for combining merge operands.
+    pub fn merge_operator(mut self, op: Option<Arc<dyn MergeOperator>>) -> Self {
+        self.merge_operator = op;
         self
     }
 
@@ -91,6 +104,119 @@ impl<'a, I: Iterator<Item = Item>> CompactionStream<'a, I> {
             next?;
         }
     }
+
+    /// Collects merge operands for the current key and returns
+    /// (operands, base_value_if_any, seqno_of_head).
+    ///
+    /// The `head` should already be a Merge operand.
+    fn collect_merge_operands(
+        &mut self,
+        head: InternalValue,
+    ) -> crate::Result<(Vec<UserValue>, Option<InternalValue>)> {
+        let user_key = &head.key.user_key;
+
+        // Operands are collected from newest to oldest (as they appear in the stream)
+        // We'll reverse them later when applying full_merge
+        let mut operands = vec![head.value.clone()];
+
+        loop {
+            let Some(peeked) = self.inner.peek() else {
+                // No more items
+                return Ok((operands, None));
+            };
+
+            let Ok(peeked) = peeked else {
+                // Error - return it
+                #[expect(
+                    clippy::expect_used,
+                    reason = "we just asserted, the peeked value is an error"
+                )]
+                return Err(self
+                    .inner
+                    .next()
+                    .expect("value should exist")
+                    .expect_err("should be error"));
+            };
+
+            // Different key - we're done collecting
+            if peeked.key.user_key != *user_key {
+                return Ok((operands, None));
+            }
+
+            // Same key - consume and check type
+            #[expect(clippy::expect_used, reason = "we just peeked, so next should work")]
+            let next = self.inner.next().expect("should exist")?;
+
+            match next.key.value_type {
+                ValueType::Merge => {
+                    // Another merge operand - add to list
+                    operands.push(next.value.clone());
+                }
+                ValueType::Value | ValueType::Indirection => {
+                    // Base value found
+                    return Ok((operands, Some(next)));
+                }
+                ValueType::Tombstone | ValueType::WeakTombstone => {
+                    // Tombstone means no base value - treat as full_merge(None, operands)
+                    return Ok((operands, None));
+                }
+            }
+        }
+    }
+
+    /// Applies the merge operator to combine operands with an optional base value.
+    fn apply_merge(
+        &self,
+        user_key: &UserKey,
+        operands: Vec<UserValue>,
+        base_value: Option<&UserValue>,
+        seqno: SeqNo,
+    ) -> Option<InternalValue> {
+        let Some(merge_op) = &self.merge_operator else {
+            // No merge operator - this shouldn't happen, but keep the first operand
+            log::warn!(
+                "Merge operands found but no merge operator configured for key {:?}",
+                user_key
+            );
+            // Return the newest operand as-is
+            #[expect(clippy::expect_used, reason = "operands is non-empty")]
+            let value = operands.into_iter().next().expect("operands non-empty");
+            return Some(InternalValue::from_components(
+                user_key.clone(),
+                value,
+                seqno,
+                ValueType::Value,
+            ));
+        };
+
+        // Operands are in newest-to-oldest order, reverse for oldest-to-newest
+        let operands_reversed: Vec<_> = operands.iter().rev().cloned().collect();
+
+        match merge_op.full_merge(user_key, base_value, &operands_reversed) {
+            MergeResult::Success(merged_value) => Some(InternalValue::from_components(
+                user_key.clone(),
+                merged_value,
+                seqno,
+                ValueType::Value,
+            )),
+            MergeResult::Failure => {
+                // Merge failed - keep the newest operand to avoid data loss
+                log::warn!(
+                    "Merge operator '{}' failed for key {:?}, keeping newest operand",
+                    merge_op.name(),
+                    user_key
+                );
+                #[expect(clippy::expect_used, reason = "operands is non-empty")]
+                let value = operands.into_iter().next().expect("operands non-empty");
+                Some(InternalValue::from_components(
+                    user_key.clone(),
+                    value,
+                    seqno,
+                    ValueType::Merge,
+                ))
+            }
+        }
+    }
 }
 
 impl<I: Iterator<Item = Item>> Iterator for CompactionStream<'_, I> {
@@ -99,6 +225,26 @@ impl<I: Iterator<Item = Item>> Iterator for CompactionStream<'_, I> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let mut head = fail_iter!(self.inner.next()?);
+
+            // Handle merge operands
+            if head.key.value_type == ValueType::Merge {
+                let user_key = head.key.user_key.clone();
+                let head_seqno = head.key.seqno;
+
+                let (operands, base_value) = fail_iter!(self.collect_merge_operands(head));
+
+                let base_value_ref = base_value.as_ref().map(|v| &v.value);
+                let merged = self.apply_merge(&user_key, operands, base_value_ref, head_seqno);
+
+                if let Some(mut merged_item) = merged {
+                    if self.zero_seqnos && merged_item.key.seqno < self.gc_seqno_threshold {
+                        merged_item.key.seqno = 0;
+                    }
+                    return Some(Ok(merged_item));
+                }
+                // Merge produced nothing, continue to next item
+                continue;
+            }
 
             if let Some(peeked) = self.inner.peek() {
                 let Ok(peeked) = peeked else {

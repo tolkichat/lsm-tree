@@ -20,8 +20,8 @@ pub use restart_interval::RestartIntervalPolicy;
 pub type PartitioningPolicy = PinningPolicy;
 
 use crate::{
-    path::absolute_path, version::DEFAULT_LEVEL_COUNT, AnyTree, BlobTree, Cache, CompressionType,
-    DescriptorTable, SequenceNumberCounter, Tree,
+    merge_operator::MergeOperator, path::absolute_path, version::DEFAULT_LEVEL_COUNT, AnyTree,
+    BlobTree, Cache, CompressionType, DescriptorTable, SequenceNumberCounter, Tree,
 };
 use std::{
     path::{Path, PathBuf},
@@ -235,6 +235,10 @@ pub struct Config {
     pub(crate) seqno: SequenceNumberCounter,
 
     pub(crate) visible_seqno: SequenceNumberCounter,
+
+    /// Optional merge operator for atomic read-modify-write operations
+    #[doc(hidden)]
+    pub merge_operator: Option<Arc<dyn MergeOperator>>,
 }
 
 // TODO: remove default?
@@ -289,6 +293,8 @@ impl Default for Config {
             expect_point_read_hits: false,
 
             kv_separation_opts: None,
+
+            merge_operator: None,
         }
     }
 }
@@ -450,6 +456,16 @@ impl Config {
     #[must_use]
     pub fn with_kv_separation(mut self, opts: Option<KvSeparationOptions>) -> Self {
         self.kv_separation_opts = opts;
+        self
+    }
+
+    /// Sets the merge operator for atomic read-modify-write operations.
+    ///
+    /// A merge operator allows efficient partial updates without requiring
+    /// a full read-modify-write cycle.
+    #[must_use]
+    pub fn merge_operator(mut self, operator: Option<Arc<dyn MergeOperator>>) -> Self {
+        self.merge_operator = operator;
         self
     }
 

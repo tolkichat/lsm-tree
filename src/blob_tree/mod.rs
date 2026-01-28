@@ -12,6 +12,7 @@ pub use gc::{FragmentationEntry, FragmentationMap};
 use crate::{
     coding::Decode,
     iter_guard::{IterGuard, IterGuardImpl},
+    merge_operator::MergeOperator,
     r#abstract::{AbstractTree, RangeItem},
     table::Table,
     tree::inner::MemtableId,
@@ -621,5 +622,18 @@ impl AbstractTree for BlobTree {
 
     fn remove_weak<K: Into<UserKey>>(&self, key: K, seqno: SeqNo) -> (u64, u64) {
         self.index.remove_weak(key, seqno)
+    }
+
+    fn merge<K: Into<UserKey>, V: Into<UserValue>>(
+        &self,
+        key: K,
+        operand: V,
+        seqno: SeqNo,
+    ) -> (u64, u64) {
+        self.index.merge(key, operand, seqno)
+    }
+
+    fn set_merge_operator(&self, operator: Option<Arc<dyn MergeOperator>>) {
+        self.index.set_merge_operator(operator);
     }
 }

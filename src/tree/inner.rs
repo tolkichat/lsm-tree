@@ -5,6 +5,7 @@
 use crate::{
     compaction::state::CompactionState,
     config::Config,
+    merge_operator::MergeOperator,
     stop_signal::StopSignal,
     version::{persist_version, SuperVersions, Version},
     SequenceNumberCounter, TableId,
@@ -53,6 +54,10 @@ pub struct TreeInner {
     /// Tree configuration
     pub config: Arc<Config>,
 
+    /// Merge operator for atomic read-modify-write operations.
+    /// Stored separately with interior mutability to allow updating after tree creation.
+    pub(crate) merge_operator: RwLock<Option<Arc<dyn MergeOperator>>>,
+
     /// Compaction may take a while; setting the signal to `true`
     /// will interrupt the compaction and kill the worker.
     pub(crate) stop_signal: StopSignal,
@@ -82,12 +87,15 @@ impl TreeInner {
         );
         persist_version(&config.path, &version)?;
 
+        let merge_op = config.merge_operator.clone();
+
         Ok(Self {
             id: get_next_tree_id(),
             memtable_id_counter: SequenceNumberCounter::new(1),
             table_id_counter: SequenceNumberCounter::default(),
             blob_file_id_counter: SequenceNumberCounter::default(),
             config: Arc::new(config),
+            merge_operator: RwLock::new(merge_op),
             version_history: Arc::new(RwLock::new(SuperVersions::new(version))),
             stop_signal: StopSignal::default(),
             major_compaction_lock: RwLock::default(),

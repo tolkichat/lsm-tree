@@ -30,6 +30,7 @@ impl std::fmt::Debug for InternalKey {
                 ValueType::Value => "V",
                 ValueType::Tombstone => "T",
                 ValueType::WeakTombstone => "W",
+                ValueType::Merge => "M",
                 ValueType::Indirection => "Vb",
             },
         )

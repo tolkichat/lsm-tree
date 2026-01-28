@@ -124,6 +124,31 @@ impl Memtable {
         })
     }
 
+    /// Returns all entries for a key with seqno <= requested seqno.
+    ///
+    /// Entries are returned in order from highest seqno (newest) to lowest seqno (oldest).
+    /// This is used for merge operator support to collect all merge operands.
+    #[doc(hidden)]
+    pub fn range_for_key(&self, key: &[u8], seqno: SeqNo) -> Vec<InternalValue> {
+        if seqno == 0 {
+            return Vec::new();
+        }
+
+        // NOTE: Due to InternalKey's Ord impl using Reverse(seqno), we need to use
+        // seqno (not seqno-1) to include entries with the requested seqno.
+        // The range starts from the key with the requested seqno.
+        let lower_bound = InternalKey::new(key, seqno, ValueType::Value);
+
+        self.items
+            .range(lower_bound..)
+            .take_while(|entry| &*entry.key().user_key == key)
+            .map(|entry| InternalValue {
+                key: entry.key().clone(),
+                value: entry.value().clone(),
+            })
+            .collect()
+    }
+
     /// Gets approximate size of memtable in bytes.
     pub fn size(&self) -> u64 {
         self.approximate_size

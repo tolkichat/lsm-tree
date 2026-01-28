@@ -3,8 +3,9 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{
-    iter_guard::IterGuardImpl, table::Table, version::Version, vlog::BlobFile, AnyTree, BlobTree,
-    Config, Guard, InternalValue, KvPair, Memtable, SeqNo, TableId, Tree, UserKey, UserValue,
+    iter_guard::IterGuardImpl, merge_operator::MergeOperator, table::Table, version::Version,
+    vlog::BlobFile, AnyTree, BlobTree, Config, Guard, InternalValue, KvPair, Memtable, SeqNo,
+    TableId, Tree, UserKey, UserValue,
 };
 use std::{
     ops::RangeBounds,
@@ -598,4 +599,29 @@ pub trait AbstractTree {
     /// Will return `Err` if an IO error occurs.
     #[doc(hidden)]
     fn remove_weak<K: Into<UserKey>>(&self, key: K, seqno: SeqNo) -> (u64, u64);
+
+    /// Adds a merge operand for a key.
+    ///
+    /// Merge operands are combined with existing values using the configured
+    /// merge operator during reads and compaction.
+    ///
+    /// Returns the added item's size and new size of the memtable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no merge operator is configured.
+    #[doc(hidden)]
+    fn merge<K: Into<UserKey>, V: Into<UserValue>>(
+        &self,
+        key: K,
+        operand: V,
+        seqno: SeqNo,
+    ) -> (u64, u64);
+
+    /// Sets or updates the merge operator for this tree.
+    ///
+    /// This allows changing the merge operator after the tree has been created/recovered,
+    /// which is necessary for recovering keyspaces since merge operators cannot be persisted.
+    #[doc(hidden)]
+    fn set_merge_operator(&self, operator: Option<Arc<dyn MergeOperator>>);
 }

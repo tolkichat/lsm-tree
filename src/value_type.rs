@@ -15,6 +15,11 @@ pub enum ValueType {
     /// "Weak" deletion (a.k.a. `SingleDelete` in `RocksDB`)
     WeakTombstone,
 
+    /// Merge operand (a.k.a. `Merge` in `RocksDB`)
+    ///
+    /// Used for atomic read-modify-write operations.
+    Merge = 3,
+
     /// Value pointer
     ///
     /// Points to a blob in a blob file.
@@ -26,6 +31,12 @@ impl ValueType {
     #[must_use]
     pub fn is_tombstone(self) -> bool {
         self == Self::Tombstone || self == Self::WeakTombstone
+    }
+
+    /// Returns `true` if the type is a merge operand.
+    #[must_use]
+    pub fn is_merge(self) -> bool {
+        self == Self::Merge
     }
 
     pub(crate) fn is_indirection(self) -> bool {
@@ -41,6 +52,7 @@ impl TryFrom<u8> for ValueType {
             0 => Ok(Self::Value),
             1 => Ok(Self::Tombstone),
             2 => Ok(Self::WeakTombstone),
+            3 => Ok(Self::Merge),
             4 => Ok(Self::Indirection),
             _ => Err(()),
         }
@@ -53,6 +65,7 @@ impl From<ValueType> for u8 {
             ValueType::Value => 0,
             ValueType::Tombstone => 1,
             ValueType::WeakTombstone => 2,
+            ValueType::Merge => 3,
             ValueType::Indirection => 4,
         }
     }

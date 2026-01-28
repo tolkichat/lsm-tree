@@ -14,6 +14,7 @@ use crate::{
     iter_guard::{IterGuard, IterGuardImpl},
     manifest::Manifest,
     memtable::Memtable,
+    merge_operator::{MergeOperator, MergeResult},
     slice::Slice,
     table::Table,
     value::InternalValue,
@@ -115,7 +116,26 @@ impl AbstractTree for Tree {
             .expect("lock is poisoned")
             .get_version_for_snapshot(seqno);
 
-        Self::get_internal_entry_from_version(&super_version, key, seqno)
+        let entry = Self::get_internal_entry_from_version(&super_version, key, seqno)?;
+
+        // Handle merge operands
+        if let Some(ref item) = entry {
+            if item.key.value_type == ValueType::Merge {
+                #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
+                let merge_op_guard = self.merge_operator.read().expect("lock is poisoned");
+                if let Some(ref merge_op) = *merge_op_guard {
+                    return Self::resolve_merge_operands(
+                        &super_version,
+                        key,
+                        seqno,
+                        item.clone(),
+                        merge_op.as_ref(),
+                    );
+                }
+            }
+        }
+
+        Ok(entry)
     }
 
     fn current_version(&self) -> Version {
@@ -617,6 +637,22 @@ impl AbstractTree for Tree {
         let value = InternalValue::new_weak_tombstone(key, seqno);
         self.append_entry(value)
     }
+
+    fn merge<K: Into<UserKey>, V: Into<UserValue>>(
+        &self,
+        key: K,
+        operand: V,
+        seqno: SeqNo,
+    ) -> (u64, u64) {
+        let value = InternalValue::from_components(key, operand, seqno, ValueType::Merge);
+        self.append_entry(value)
+    }
+
+    fn set_merge_operator(&self, operator: Option<Arc<dyn MergeOperator>>) {
+        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
+        let mut guard = self.merge_operator.write().expect("lock is poisoned");
+        *guard = operator;
+    }
 }
 
 impl Tree {
@@ -703,6 +739,153 @@ impl Tree {
         }
 
         None
+    }
+
+    /// Resolves merge operands for a key by collecting all merge operands
+    /// and the base value (if any), then applying the merge operator.
+    fn resolve_merge_operands(
+        super_version: &SuperVersion,
+        key: &[u8],
+        seqno: SeqNo,
+        first_merge: InternalValue,
+        merge_op: &dyn MergeOperator,
+    ) -> crate::Result<Option<InternalValue>> {
+        let head_seqno = first_merge.key.seqno;
+        let user_key = first_merge.key.user_key.clone();
+
+        // Collect merge operands (newest to oldest)
+        let mut operands = vec![first_merge.value];
+        let mut base_value: Option<InternalValue> = None;
+
+        // We need to continue scanning from the seqno before the first merge
+        // to find older merge operands and the base value
+        let continue_seqno = head_seqno.saturating_sub(1);
+
+        // Continue looking in active memtable for older entries
+        Self::collect_merge_operands_from_memtable(
+            &super_version.active_memtable,
+            key,
+            continue_seqno,
+            &mut operands,
+            &mut base_value,
+        );
+
+        // If we haven't found a base value yet, continue looking in sealed memtables
+        if base_value.is_none() || base_value.as_ref().is_some_and(|v| v.key.value_type == ValueType::Merge) {
+            for mt in super_version.sealed_memtables.iter().rev() {
+                Self::collect_merge_operands_from_memtable(
+                    mt,
+                    key,
+                    continue_seqno,
+                    &mut operands,
+                    &mut base_value,
+                );
+                if base_value.as_ref().is_some_and(|v| v.key.value_type != ValueType::Merge) {
+                    break;
+                }
+            }
+        }
+
+        // If we still haven't found a base value, look in tables
+        if base_value.is_none() || base_value.as_ref().is_some_and(|v| v.key.value_type == ValueType::Merge) {
+            Self::collect_merge_operands_from_tables(
+                &super_version.version,
+                key,
+                continue_seqno,
+                &mut operands,
+                &mut base_value,
+            )?;
+        }
+
+        // Extract the base value if it's not a merge operand
+        let base_value_ref = base_value
+            .as_ref()
+            .filter(|v| v.key.value_type != ValueType::Merge)
+            .map(|v| &v.value);
+
+        // Apply the merge operator (operands are in newest-to-oldest order, reverse for oldest-to-newest)
+        let operands_reversed: Vec<_> = operands.iter().rev().cloned().collect();
+
+        match merge_op.full_merge(&user_key, base_value_ref, &operands_reversed) {
+            MergeResult::Success(merged_value) => Ok(Some(InternalValue::from_components(
+                user_key,
+                merged_value,
+                head_seqno,
+                ValueType::Value,
+            ))),
+            MergeResult::Failure => {
+                // Merge failed - return the newest operand as-is to avoid data loss
+                log::warn!(
+                    "Merge operator '{}' failed for key {:?}, returning newest operand",
+                    merge_op.name(),
+                    user_key
+                );
+                // Use first operand or empty slice as fallback
+                let fallback = operands.into_iter().next().unwrap_or_else(|| vec![].into());
+                Ok(Some(InternalValue::from_components(
+                    user_key,
+                    fallback,
+                    head_seqno,
+                    ValueType::Merge,
+                )))
+            }
+        }
+    }
+
+    /// Collects merge operands from a memtable.
+    /// Updates `operands` with any Merge entries found, and `base_value` if a non-Merge entry is found.
+    fn collect_merge_operands_from_memtable(
+        memtable: &Memtable,
+        key: &[u8],
+        seqno: SeqNo,
+        operands: &mut Vec<UserValue>,
+        base_value: &mut Option<InternalValue>,
+    ) {
+        // The memtable stores entries by (key, seqno DESC)
+        // We need to iterate through all entries for this key with seqno <= our seqno
+        for entry in memtable.range_for_key(key, seqno) {
+            match entry.key.value_type {
+                ValueType::Merge => {
+                    operands.push(entry.value);
+                }
+                _ => {
+                    *base_value = Some(entry);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Collects merge operands from disk tables.
+    fn collect_merge_operands_from_tables(
+        version: &Version,
+        key: &[u8],
+        seqno: SeqNo,
+        operands: &mut Vec<UserValue>,
+        base_value: &mut Option<InternalValue>,
+    ) -> crate::Result<()> {
+        for table in version
+            .iter_levels()
+            .flat_map(|lvl| lvl.iter())
+            .filter_map(|run| run.get_for_key(key))
+        {
+            // Get ALL entries for this key from the table, not just the first one
+            let entries = table.range_for_key(key, seqno)?;
+
+            for item in entries {
+                match item.key.value_type {
+                    ValueType::Merge => {
+                        operands.push(item.value);
+                    }
+                    _ => {
+                        *base_value = Some(item);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) fn get_version_for_snapshot(&self, seqno: SeqNo) -> SuperVersion {
@@ -934,6 +1117,8 @@ impl Tree {
             .max()
             .unwrap_or_default();
 
+        let merge_op = config.merge_operator.clone();
+
         let inner = TreeInner {
             id: tree_id,
             memtable_id_counter: SequenceNumberCounter::default(),
@@ -942,6 +1127,7 @@ impl Tree {
             version_history: Arc::new(RwLock::new(SuperVersions::new(version))),
             stop_signal: StopSignal::default(),
             config: Arc::new(config),
+            merge_operator: RwLock::new(merge_op),
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),

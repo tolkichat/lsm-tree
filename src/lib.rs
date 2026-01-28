@@ -105,6 +105,7 @@ mod key;
 mod key_range;
 mod manifest;
 mod memtable;
+mod merge_operator;
 mod run_reader;
 mod run_scanner;
 
@@ -181,6 +182,7 @@ pub use {
     ingestion::AnyIngestion,
     iter_guard::IterGuard as Guard,
     memtable::{Memtable, MemtableId},
+    merge_operator::{MergeOperator, MergeResult},
     r#abstract::AbstractTree,
     seqno::SequenceNumberCounter,
     slice::Slice,
