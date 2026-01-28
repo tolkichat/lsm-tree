@@ -63,6 +63,63 @@ Uses [`bytes`](https://github.com/tokio-rs/bytes) as the underlying `Slice` type
 
 *Disabled by default.*
 
+## Merge Operator
+
+Merge operators allow you to perform atomic read-modify-write operations without reading the value first. This is useful for counters, appending to lists, or updating specific fields in a record.
+
+```rust
+use lsm_tree::{Config, MergeOperator, MergeResult, UserKey, UserValue};
+use std::sync::Arc;
+
+// Define a counter merge operator
+struct CounterMerge;
+
+impl MergeOperator for CounterMerge {
+    fn name(&self) -> &'static str {
+        "CounterMerge"
+    }
+
+    fn full_merge(
+        &self,
+        _key: &UserKey,
+        existing_value: Option<&UserValue>,
+        operands: &[UserValue],
+    ) -> MergeResult {
+        // Parse existing value as i64, defaulting to 0
+        let mut counter = existing_value
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        // Add all operands
+        for operand in operands {
+            if let Some(delta) = std::str::from_utf8(operand)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                counter += delta;
+            }
+        }
+
+        MergeResult::Success(counter.to_string().into_bytes().into())
+    }
+}
+
+// Use the merge operator
+let config = Config::new(folder)
+    .merge_operator(Arc::new(CounterMerge));
+
+let tree = config.open()?;
+
+// Increment counter without reading first
+tree.merge("hits", "1", seqno);
+tree.merge("hits", "1", seqno + 1);
+tree.merge("hits", "5", seqno + 2);
+
+// Reading will return "7"
+let value = tree.get("hits")?;
+```
+
 ## Run unit benchmarks
 
 ```bash
