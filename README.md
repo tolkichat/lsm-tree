@@ -34,6 +34,7 @@ This is the most feature-rich LSM-tree implementation in Rust! It features:
 - Multi-threaded flushing (immutable/sealed memtables)
 - Key-value separation (optional) [[2]](#footnotes)
 - Single deletion tombstones ("weak" deletion)
+- Merge operator for atomic read-modify-write operations [[4]](#footnotes)
 
 Keys are limited to 65536 bytes, values are limited to 2^32 bytes.
 As is normal with any kind of storage engine, larger keys and values have a bigger performance impact.
@@ -81,3 +82,5 @@ All contributions are to be licensed as MIT OR Apache-2.0.
 [2] https://github.com/facebook/rocksdb/wiki/BlobDB
 
 [3] https://rocksdb.org/blog/2018/08/23/data-block-hash-index.html
+
+[4] https://github.com/facebook/rocksdb/wiki/Merge-Operator
